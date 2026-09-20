@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""claudeinstall — install apps on any Linux/macOS by name *or* by description.
+
+    claudeinstall htop                       # known package -> installs directly, no AI
+    claudeinstall "python dev headers"       # asks Claude Haiku which package that is here
+    claudeinstall "a light image viewer"     # description -> package -> confirm -> install
+
+Flow:
+  1. detect distro + which package managers exist on this machine
+  2. if the query is an exact package name in a local repo -> skip the AI entirely
+  3. otherwise ask Claude Haiku for {manager, package} as JSON (never a raw shell command)
+  4. verify the package really exists with that manager
+  5. show the command we built ourselves, ask y/N, run it (sudo -A when SUDO_ASKPASS is set)
+
+Backends: the `claude` CLI (default, uses your Claude subscription, no API key) or the
+Anthropic SDK when ANTHROPIC_API_KEY is set / --backend api is given.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "0.1.0"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claudeinstall"
+DEFAULT_MODEL_CLI = "haiku"            # alias understood by the claude CLI
+DEFAULT_MODEL_API = "claude-haiku-4-5"  # exact API model id
+
+# ---------------------------------------------------------------------------
+# package managers: how to detect, verify a package, and build the install command
+# ---------------------------------------------------------------------------
+# order = the preference order fed to the model (native repo first, sandboxed formats last)
+MANAGERS: dict[str, dict] = {
+    "pacman":   {"bin": "pacman",       "sudo": True,  "verify": ["pacman", "-Si", "{p}"],          "install": ["pacman", "-S", "--needed", "{p}"],   "desc": "Arch official repos"},
+    "paru":     {"bin": "paru",         "sudo": False, "verify": ["paru", "-Si", "{p}"],            "install": ["paru", "-S", "--needed", "{p}"],     "desc": "Arch repos + AUR"},
+    "yay":      {"bin": "yay",          "sudo": False, "verify": ["yay", "-Si", "{p}"],             "install": ["yay", "-S", "--needed", "{p}"],      "desc": "Arch repos + AUR"},
+    "apt":      {"bin": "apt-get",      "sudo": True,  "verify": ["apt-cache", "show", "{p}"],      "install": ["apt", "install", "{p}"],             "desc": "Debian/Ubuntu repos"},
+    "dnf":      {"bin": "dnf",          "sudo": True,  "verify": ["dnf", "-q", "info", "{p}"],      "install": ["dnf", "install", "{p}"],             "desc": "Fedora/RHEL repos"},
+    "yum":      {"bin": "yum",          "sudo": True,  "verify": ["yum", "-q", "info", "{p}"],      "install": ["yum", "install", "{p}"],             "desc": "RHEL/CentOS repos"},
+    "zypper":   {"bin": "zypper",       "sudo": True,  "verify": ["zypper", "-q", "info", "{p}"],   "install": ["zypper", "install", "{p}"],          "desc": "openSUSE repos", "verify_grep": "Information for package"},
+    "apk":      {"bin": "apk",          "sudo": True,  "verify": ["apk", "search", "-e", "{p}"],    "install": ["apk", "add", "{p}"],                 "desc": "Alpine repos", "verify_nonempty": True},
+    "xbps":     {"bin": "xbps-install", "sudo": True,  "verify": ["xbps-query", "-R", "{p}"],       "install": ["xbps-install", "-S", "{p}"],         "desc": "Void repos"},
+    "emerge":   {"bin": "emerge",       "sudo": True,  "verify": None,                              "install": ["emerge", "--ask", "{p}"],            "desc": "Gentoo portage"},
+    "nix":      {"bin": "nix-env",      "sudo": False, "verify": None,                              "install": ["nix-env", "-iA", "nixpkgs.{p}"],     "desc": "Nix packages"},
+    "brew":     {"bin": "brew",         "sudo": False, "verify": ["brew", "info", "{p}"],           "install": ["brew", "install", "{p}"],            "desc": "Homebrew formula"},
+    "brew-cask":{"bin": "brew",         "sudo": False, "verify": ["brew", "info", "--cask", "{p}"], "install": ["brew", "install", "--cask", "{p}"],  "desc": "Homebrew cask (GUI apps)"},
+    "pipx":     {"bin": "pipx",         "sudo": False, "verify": None,                              "install": ["pipx", "install", "{p}"],            "desc": "Python CLI tools from PyPI"},
+    "cargo":    {"bin": "cargo",        "sudo": False, "verify": None,                              "install": ["cargo", "install", "{p}"],           "desc": "Rust crates from crates.io"},
+    "npm":      {"bin": "npm",          "sudo": False, "verify": ["npm", "view", "{p}", "name"],    "install": ["npm", "install", "-g", "{p}"],       "desc": "Node packages (global)"},
+    "flatpak":  {"bin": "flatpak",      "sudo": False, "verify": ["flatpak", "search", "--columns=application", "{p}"], "install": ["flatpak", "install", "flathub", "{p}"], "desc": "Flatpak from Flathub (last resort)", "verify_grep": "{p}"},
+    "snap":     {"bin": "snap",         "sudo": True,  "verify": ["snap", "info", "{p}"],           "install": ["snap", "install", "{p}"],            "desc": "Snap (last resort)"},
+}
+
+# managers whose repos hold "normal" packages — an exact-name hit here means we skip the AI
+NATIVE = ["pacman", "paru", "yay", "apt", "dnf", "yum", "zypper", "apk", "xbps", "brew"]
+
+
+class Ansi:
+    on = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    @classmethod
+    def c(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.on else s
+    @classmethod
+    def bold(cls, s): return cls.c("1", s)
+    @classmethod
+    def dim(cls, s): return cls.c("2", s)
+    @classmethod
+    def green(cls, s): return cls.c("32", s)
+    @classmethod
+    def yellow(cls, s): return cls.c("33", s)
+    @classmethod
+    def red(cls, s): return cls.c("31", s)
+    @classmethod
+    def cyan(cls, s): return cls.c("36", s)
+
+
+def info(msg: str) -> None:
+    print(Ansi.cyan("::"), msg, flush=True)
+
+def warn(msg: str) -> None:
+    print(Ansi.yellow("!!"), msg, file=sys.stderr)
+
+def die(msg: str, code: int = 1) -> None:
+    print(Ansi.red("error:"), msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# system detection
+# ---------------------------------------------------------------------------
+def detect_os() -> dict:
+    d = {"system": platform.system(), "id": "", "id_like": "", "pretty": platform.platform()}
+    if d["system"] == "Darwin":
+        d["id"] = "macos"
+        d["pretty"] = f"macOS {platform.mac_ver()[0]}"
+        return d
+    try:
+        kv = {}
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k] = v.strip().strip('"')
+        d["id"] = kv.get("ID", "linux")
+        d["id_like"] = kv.get("ID_LIKE", "")
+        d["pretty"] = kv.get("PRETTY_NAME", d["id"])
+    except OSError:
+        d["id"] = "linux"
+    return d
+
+
+def detect_managers() -> list[str]:
+    found = [name for name, m in MANAGERS.items() if shutil.which(m["bin"])]
+    # brew-cask only makes sense on macOS
+    if platform.system() != "Darwin" and "brew-cask" in found:
+        found.remove("brew-cask")
+    return found
+
+
+def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def verify(manager: str, pkg: str) -> bool | None:
+    """True = exists, False = not found, None = this manager can't be checked cheaply."""
+    m = MANAGERS[manager]
+    if not m["verify"]:
+        return None
+    cmd = [a.replace("{p}", pkg) for a in m["verify"]]
+    try:
+        r = run(cmd, timeout=90)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if m.get("verify_grep"):
+        return m["verify_grep"].replace("{p}", pkg) in r.stdout
+    if m.get("verify_nonempty"):
+        return r.returncode == 0 and bool(r.stdout.strip())
+    return r.returncode == 0
+
+
+def build_command(manager: str, pkgs: list[str]) -> list[str]:
+    m = MANAGERS[manager]
+    tmpl = m["install"]
+    cmd: list[str] = []
+    for a in tmpl:
+        if "{p}" in a:
+            cmd.extend(a.replace("{p}", p) for p in pkgs)
+        else:
+            cmd.append(a)
+    if m["sudo"] and os.geteuid() != 0:
+        prefix = ["sudo", "-A"] if os.environ.get("SUDO_ASKPASS") else ["sudo"]
+        cmd = prefix + cmd
+    return cmd
+
+
+def looks_like_package_name(q: str) -> bool:
+    return " " not in q.strip() and re.fullmatch(r"[A-Za-z0-9@._+\-/:]+", q.strip()) is not None
+
+
+def local_lookup(query: str, managers: list[str], verbose: bool) -> tuple[str, str] | None:
+    """Exact-name hit in a native repo -> (manager, package). No AI involved."""
+    for mgr in [m for m in NATIVE if m in managers]:
+        if verbose:
+            info(f"checking {mgr} for '{query}' …")
+        if verify(mgr, query):
+            return mgr, query
+    return None
+
+
+# ---------------------------------------------------------------------------
+# AI backends
+# ---------------------------------------------------------------------------
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "found": {"type": "boolean"},
+        "manager": {"type": "string"},
+        "packages": {"type": "array", "items": {"type": "string"}},
+        "why": {"type": "string"},
+        "alternatives": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "manager": {"type": "string"},
+                    "packages": {"type": "array", "items": {"type": "string"}},
+                    "why": {"type": "string"},
+                },
+                "required": ["manager", "packages", "why"],
+                "additionalProperties": False,
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["found", "manager", "packages", "why", "alternatives", "notes"],
+    "additionalProperties": False,
+}
+
+
+def system_prompt(osd: dict, managers: list[str]) -> str:
+    mgr_lines = "\n".join(f"  - {m}: {MANAGERS[m]['desc']}" for m in managers)
+    return f"""You are claudeinstall, a package-name resolver for a command-line installer.
+
+The user describes software they want (a package name, a command name, a library, or a plain-language description) and you answer with the exact package(s) to install on THIS machine.
+
+Machine:
+  OS: {osd['pretty']} (id={osd['id']} id_like={osd['id_like'] or '-'})
+  Available package managers, in PREFERENCE ORDER (pick the earliest one that has the package):
+{mgr_lines}
+
+Rules:
+- Return ONLY a JSON object matching this schema, no prose, no markdown fences:
+  {{"found": bool, "manager": "<one of the managers above>", "packages": ["<exact package name>", ...],
+    "why": "<one short line: what it is and why this package>", 
+    "alternatives": [{{"manager": "...", "packages": ["..."], "why": "..."}}],
+    "notes": "<optional caveat, else empty string>"}}
+- Package names must be the exact names used by that manager on this distro (e.g. Arch: `python`, Debian: `python3-dev`, Fedora: `python3-devel`). Never invent names; if unsure, say so in notes and pick your best guess.
+- Prefer the distro's native repo over AUR/pipx/cargo, and those over flatpak/snap. Use flatpak/snap only when nothing else provides the software.
+- If the request names a *command* (e.g. `nvtop`, `ip`, `dig`), resolve it to the package that provides it.
+- If it's a library/header request, return the dev package for this distro.
+- Usually return one package. Return several only when the request clearly needs them together.
+- Up to 2 alternatives, only if genuinely useful (different tool, or a different manager fallback).
+- If the request is not software that can be installed, set found=false and explain in notes.
+- Never return shell commands, URLs, or curl|bash instructions — only manager + package names."""
+
+
+def strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    # be forgiving: take the first {...} block
+    m = re.search(r"\{.*\}", t, re.S)
+    return m.group(0) if m else t
+
+
+def ask_cli(sys_prompt: str, query: str, model: str, verbose: bool) -> dict:
+    if not shutil.which("claude"):
+        die("`claude` CLI not found. Install Claude Code (https://claude.com/claude-code) or use --backend api with ANTHROPIC_API_KEY.")
+    cmd = [
+        "claude", "-p", "--model", model,
+        "--tools", "",                      # pure text answer, no tool use
+        "--setting-sources", "",            # ignore user/project settings (keeps the prompt tiny)
+        "--strict-mcp-config",              # no MCP servers
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format", "json",
+        "--system-prompt", sys_prompt,
+        query,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=str(Path.home()))
+    except subprocess.TimeoutExpired:
+        die("claude CLI timed out after 120s")
+    if r.returncode != 0:
+        die(f"claude CLI failed (rc={r.returncode}): {(r.stderr or r.stdout).strip()[:500]}")
+    try:
+        env = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        die(f"unexpected claude CLI output: {r.stdout[:300]}")
+    if env.get("is_error"):
+        die(f"claude CLI error: {env.get('result')}")
+    if verbose:
+        u = env.get("usage", {})
+        info(f"claude: {u.get('input_tokens', '?')} in / {u.get('output_tokens', '?')} out tokens, {env.get('duration_api_ms', '?')} ms")
+    return json.loads(strip_fences(env.get("result", "")))
+
+
+def ask_api(sys_prompt: str, query: str, model: str, verbose: bool) -> dict:
+    try:
+        import anthropic  # type: ignore
+    except ImportError:
+        die("python package `anthropic` not installed (pip install anthropic), or use --backend cli")
+    client = anthropic.Anthropic()
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=sys_prompt,
+            messages=[{"role": "user", "content": query}],
+            output_config={"format": {"type": "json_schema", "schema": SCHEMA}},
+        )
+    except anthropic.AuthenticationError:
+        die("Anthropic API: invalid or missing API key (set ANTHROPIC_API_KEY)")
+    except anthropic.RateLimitError:
+        die("Anthropic API: rate limited, try again in a minute")
+    except anthropic.APIStatusError as e:
+        die(f"Anthropic API error {e.status_code}: {e.message}")
+    except anthropic.APIConnectionError:
+        die("Anthropic API: network error")
+    if resp.stop_reason == "refusal":
+        die("Anthropic API: request was refused")
+    text = next(b.text for b in resp.content if b.type == "text")
+    if verbose:
+        info(f"claude: {resp.usage.input_tokens} in / {resp.usage.output_tokens} out tokens")
+    return json.loads(strip_fences(text))
+
+
+# ---------------------------------------------------------------------------
+# cache
+# ---------------------------------------------------------------------------
+def cache_key(osd: dict, managers: list[str], query: str) -> Path:
+    h = hashlib.sha256(f"{osd['id']}|{','.join(managers)}|{query.strip().lower()}".encode()).hexdigest()[:24]
+    return CACHE_DIR / f"{h}.json"
+
+
+def cache_get(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def cache_put(path: Path, data: dict) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=1))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        warn("stdin is not a terminal; refusing to install without -y")
+        return False
+    try:
+        ans = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("y", "yes")
+
+
+def show_plan(manager: str, pkgs: list[str], why: str, verified: bool | None, cmd: list[str]) -> None:
+    tag = {True: Ansi.green("verified"), False: Ansi.red("NOT FOUND"), None: Ansi.yellow("unverified")}[verified]
+    print()
+    print(f"  {Ansi.bold('package')}  {' '.join(pkgs)}  {Ansi.dim('via')} {manager} ({MANAGERS[manager]['desc']})  [{tag}]")
+    if why:
+        print(f"  {Ansi.bold('why')}      {why}")
+    print(f"  {Ansi.bold('command')}  {Ansi.cyan(' '.join(cmd))}")
+    print()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="claudeinstall",
+        description="Install software by name or description; Claude Haiku resolves the package name for your distro.",
+    )
+    ap.add_argument("query", nargs="+", help="package name, command name, or plain-language description")
+    ap.add_argument("-y", "--yes", action="store_true", help="skip the y/N confirmation")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show what would be run, don't run it")
+    ap.add_argument("--no-ai", action="store_true", help="only try exact local package names, never call Claude")
+    ap.add_argument("--no-cache", action="store_true", help="ignore and don't write the answer cache")
+    ap.add_argument("--backend", choices=["auto", "cli", "api"], default="auto",
+                    help="auto = api if ANTHROPIC_API_KEY is set, else the claude CLI")
+    ap.add_argument("--model", help=f"model override (default: '{DEFAULT_MODEL_CLI}' for cli, '{DEFAULT_MODEL_API}' for api)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--version", action="version", version=f"claudeinstall {VERSION}")
+    args = ap.parse_args()
+
+    query = " ".join(args.query).strip()
+    osd = detect_os()
+    managers = detect_managers()
+    if not managers:
+        die("no supported package manager found on this machine")
+    if args.verbose:
+        info(f"{osd['pretty']} — managers: {', '.join(managers)}")
+
+    manager = pkgs = why = None
+    alternatives: list[dict] = []
+    notes = ""
+    source = ""
+
+    # 1. exact local hit -> no AI
+    if looks_like_package_name(query):
+        hit = local_lookup(query, managers, args.verbose)
+        if hit:
+            manager, pkgs = hit[0], [hit[1]]
+            why = "exact package name found in local repo"
+            source = "local"
+
+    # 2. ask Claude
+    if manager is None:
+        if args.no_ai:
+            die(f"'{query}' is not an exact package name here and --no-ai was given")
+        backend = args.backend
+        if backend == "auto":
+            backend = "api" if os.environ.get("ANTHROPIC_API_KEY") else "cli"
+        model = args.model or (DEFAULT_MODEL_API if backend == "api" else DEFAULT_MODEL_CLI)
+
+        ckey = cache_key(osd, managers, query)
+        data = None if args.no_cache else cache_get(ckey)
+        if data:
+            source = "cache"
+            if args.verbose:
+                info(f"cache hit: {ckey}")
+        else:
+            info(f"asking Claude ({backend}/{model}) what '{query}' is on {osd['pretty']} …")
+            sp = system_prompt(osd, managers)
+            try:
+                data = ask_api(sp, query, model, args.verbose) if backend == "api" else ask_cli(sp, query, model, args.verbose)
+            except (json.JSONDecodeError, ValueError) as e:
+                die(f"could not parse Claude's answer as JSON: {e}")
+            source = backend
+        if not data.get("found") or not data.get("packages"):
+            die(f"Claude could not map that to a package. {data.get('notes') or ''}".strip())
+        manager = data.get("manager", "")
+        pkgs = [p for p in data.get("packages", []) if isinstance(p, str) and p.strip()]
+        why = data.get("why", "")
+        alternatives = data.get("alternatives") or []
+        notes = data.get("notes") or ""
+        if manager not in managers:
+            # model picked something we don't have; try to fall back to an alternative we do have
+            usable = [a for a in alternatives if a.get("manager") in managers and a.get("packages")]
+            if usable:
+                warn(f"Claude suggested '{manager}' which isn't installed here; using alternative")
+                alternatives = [a for a in alternatives if a is not usable[0]]
+                manager, pkgs, why = usable[0]["manager"], usable[0]["packages"], usable[0].get("why", "")
+            else:
+                die(f"Claude suggested manager '{manager}' which is not available on this machine ({', '.join(managers)}). "
+                    f"Packages: {' '.join(pkgs)}. {notes}")
+        if source != "cache" and not args.no_cache:
+            cache_put(ckey, data)
+
+    # 3. verify with the real package manager
+    verified: bool | None = True if source == "local" else None
+    if source != "local":
+        results = [verify(manager, p) for p in pkgs]
+        if any(r is False for r in results):
+            verified = False
+        elif all(r is True for r in results):
+            verified = True
+        else:
+            verified = None
+
+    if verified is False and alternatives:
+        # try alternatives before giving up
+        for alt in alternatives:
+            am, ap_ = alt.get("manager"), alt.get("packages") or []
+            if am in managers and ap_ and all(verify(am, p) is not False for p in ap_):
+                warn(f"'{' '.join(pkgs)}' not found via {manager}; trying alternative")
+                manager, pkgs, why = am, ap_, alt.get("why", "")
+                verified = True if all(verify(am, p) for p in ap_) else None
+                alternatives = [a for a in alternatives if a is not alt]
+                break
+
+    cmd = build_command(manager, pkgs)
+    show_plan(manager, pkgs, why, verified, cmd)
+    if notes:
+        print(f"  {Ansi.bold('note')}     {notes}\n")
+    if alternatives:
+        print(f"  {Ansi.dim('alternatives (not verified):')}")
+        for a in alternatives:
+            if a.get("manager") in MANAGERS and a.get("packages"):
+                acmd = " ".join(build_command(a["manager"], a["packages"]))
+                print(f"    {Ansi.dim('-')} {' '.join(a['packages'])} via {a['manager']}: {a.get('why', '')}\n      {Ansi.dim(acmd)}")
+        print()
+
+    if verified is False:
+        warn("the package manager says this package does not exist — Claude may have guessed wrong")
+        if not args.yes:
+            return 2
+    if args.dry_run:
+        info("dry run, nothing installed")
+        return 0
+    if not args.yes and not confirm(f"{Ansi.bold('Run it?')} [y/N] "):
+        info("aborted")
+        return 130
+
+    print()
+    try:
+        rc = subprocess.call(cmd)
+    except KeyboardInterrupt:
+        print()
+        return 130
+    if rc != 0:
+        warn(f"command exited with {rc}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
