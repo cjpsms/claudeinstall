@@ -88,4 +88,4 @@ Exit codes: `0` ok / dry run · `1` error · `2` package not found (refused) · 
 
 ## License
 
-MIT
+0BSD
